@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment & Secrets
+.env
+!.env.sample
+*.key.json
+
+# Logs, ADK, & OS files
+logs/
+*.log
+*.pid
+.adk/
+.DS_Store

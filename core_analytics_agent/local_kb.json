@@ -1,0 +1,10 @@
+{
+  "analytics_playbook": {
+    "local_bigquery_analytics": "Run SQL analytics directly on the public US Names dataset ('bigquery-public-data.usa_names.usa_1910_current') using 'analyze_name_in_bigquery' to check any first name's total historical US births, peak popularity year, and top state.",
+    "local_mcp_storage": "Read and write private workspace notes and executive comparison reports in 'local_kb.json' using 'query_local_mcp_kb' and 'write_local_mcp_kb'.",
+    "remote_a2a_collaboration": "Internal corporate employee name analytics (the 5,000-employee Corporate Directory) are served by 'corporate_names_analytics_agent' behind Zero-Trust JWT authentication. Query 'gateway_agent' to discover its URL and exchange your Google Cloud OIDC/ADC identity for a short-lived 'X-Gateway-Token' JWT."
+  },
+  "local_workspace_notes": {
+    "welcome_note": "Local MCP storage active. No static credentials or API keys are stored in this file; authentication to the Gateway Agent uses Google Cloud OIDC / Application Default Credentials out-of-band in the HTTP transport layer."
+  }
+}
