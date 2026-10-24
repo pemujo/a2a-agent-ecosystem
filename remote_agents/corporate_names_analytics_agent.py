@@ -3,9 +3,10 @@
 Represents a protected internal enterprise A2A service running on port 8002:
   1. Public Discovery (`GET /.well-known/agent-card.json`): Allows any A2A
      client to inspect the agent's skills without authentication.
-  2. Zero-Trust Cryptographic JWT Enforcement (`POST /`): The Starlette
-     middleware `verify_gateway_jwt_and_rewrite_card` verifies the HMAC-SHA256
-     signature, issuer (`"gateway_agent"`), target audience
+  2. Zero-Trust Asymmetric JWT Enforcement (`POST /`): The Starlette
+     middleware `verify_gateway_jwt_and_rewrite_card` fetches the Gateway
+     Agent's public RSA key from `/.well-known/jwks.json` and verifies the
+     RS256 cryptographic signature, issuer (`"gateway_agent"`), target audience
      (`"corporate_names_analytics_v2"`), and 5-minute expiration timestamp of
      the `X-Gateway-Token` JWT before executing any JSON-RPC `POST` request.
   3. Specialist Capability:
@@ -14,8 +15,6 @@ Represents a protected internal enterprise A2A service running on port 8002:
 """
 
 import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -44,10 +43,14 @@ def _load_dotenv_if_present() -> None:
 
 _load_dotenv_if_present()
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import rsa
 from google.adk.a2a.utils.agent_to_a2a import to_a2a
 from google.adk.agents import Agent
 from google.adk.models.google_llm import Gemini
 from google.genai import types
+import httpx
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -60,11 +63,12 @@ RETRY_OPTIONS = types.HttpRetryOptions(
     http_status_codes=[408, 429, 500, 502, 503, 504],
 )
 
-GATEWAY_JWT_SECRET = os.getenv(
-    "GATEWAY_JWT_SECRET", "a2a-enterprise-gateway-hs256-signing-secret-2026"
-)
+GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:8001").rstrip("/")
 EXPECTED_AUDIENCE = "corporate_names_analytics_v2"
 TOTAL_EMPLOYEES = 5000
+
+# In-memory cache of RSA public keys fetched from `GATEWAY_URL/.well-known/jwks.json`, keyed by `kid`.
+_JWKS_PUBLIC_KEY_CACHE: dict[str, rsa.RSAPublicKey] = {}
 
 
 def _b64url_decode(segment: str) -> bytes:
@@ -76,15 +80,49 @@ def _b64url_decode(segment: str) -> bytes:
   Returns:
     The decoded raw byte sequence.
   """
-  padding = "=" * (-len(segment) % 4)
-  return base64.urlsafe_b64decode(segment + padding)
+  padding_str = "=" * (-len(segment) % 4)
+  return base64.urlsafe_b64decode(segment + padding_str)
+
+
+def _resolve_gateway_public_key(kid: str) -> rsa.RSAPublicKey | None:
+  """Fetches and caches the Gateway Agent's RSA public key from `/.well-known/jwks.json` by `kid`."""
+  if kid and kid in _JWKS_PUBLIC_KEY_CACHE:
+    return _JWKS_PUBLIC_KEY_CACHE[kid]
+
+  jwks_data = None
+  try:
+    with httpx.Client(timeout=5.0) as client:
+      resp = client.get(f"{GATEWAY_URL}/.well-known/jwks.json")
+      if resp.status_code == 200:
+        jwks_data = resp.json()
+  except Exception:
+    pass
+
+  if jwks_data is None:
+    try:
+      from remote_agents.gateway_agent import get_gateway_jwks
+
+      jwks_data = get_gateway_jwks()
+    except Exception:
+      return None
+
+  for jwk in (jwks_data or {}).get("keys") or []:
+    if jwk.get("kty") == "RSA" and (not kid or jwk.get("kid") == kid):
+      n = int.from_bytes(_b64url_decode(jwk["n"]), "big")
+      e = int.from_bytes(_b64url_decode(jwk["e"]), "big")
+      pub_key = rsa.RSAPublicNumbers(e, n).public_key()
+      if jwk.get("kid"):
+        _JWKS_PUBLIC_KEY_CACHE[jwk["kid"]] = pub_key
+      return pub_key
+  return None
 
 
 def verify_gateway_jwt(token: str) -> tuple[bool, dict | str]:
-  """Cryptographically verifies an HS256 X-Gateway-Token JWT.
+  """Cryptographically verifies an asymmetric RS256 X-Gateway-Token JWT using the Gateway's JWKS public key.
 
-  Validates the 3-segment JWT format and JOSE header (`alg="HS256"`,
-  `typ="JWT"`), recomputes the HMAC-SHA256 signature using `GATEWAY_JWT_SECRET`,
+  Validates the 3-segment JWT format and JOSE header (`alg="RS256"`,
+  `typ="JWT"`), resolves the Gateway's public RSA key from
+  `/.well-known/jwks.json`, verifies the RSASSA-PKCS1-v1_5 SHA-256 signature,
   and checks `iss="gateway_agent"`, `sub`, `aud="corporate_names_analytics_v2"`,
   `iat`, and `exp` against the current timestamp.
 
@@ -98,41 +136,46 @@ def verify_gateway_jwt(token: str) -> tuple[bool, dict | str]:
   if not token or token.count(".") != 2:
     return False, "Missing or malformed X-Gateway-Token JWT."
 
-  # Split the JWT into `<header>.<payload>.<signature>` and verify JOSE header (`alg`, `typ`) per RFC 8725.
   header_b64, payload_b64, signature_b64 = token.split(".")
   try:
     header = json.loads(_b64url_decode(header_b64).decode("utf-8"))
   except Exception:
     return False, "Invalid JSON header in X-Gateway-Token."
 
-  if header.get("alg") != "HS256" or header.get("typ") != "JWT":
+  if header.get("alg") != "RS256" or header.get("typ") != "JWT":
     return (
         False,
         f"Unsupported JWT header alg/typ in X-Gateway-Token: alg={header.get('alg')!r}.",
     )
 
-  signing_input = f"{header_b64}.{payload_b64}"
-  expected_sig = hmac.new(
-      GATEWAY_JWT_SECRET.encode("utf-8"),
-      signing_input.encode("ascii"),
-      hashlib.sha256,
-  ).digest()
+  pub_key = _resolve_gateway_public_key(header.get("kid", ""))
+  if pub_key is None:
+    return (
+        False,
+        f"Unable to resolve Gateway public key (kid={header.get('kid')!r}) from {GATEWAY_URL}/.well-known/jwks.json.",
+    )
 
   try:
     actual_sig = _b64url_decode(signature_b64)
   except Exception:
     return False, "Invalid base64url signature encoding in X-Gateway-Token."
 
-  # Compare signatures in constant time to prevent timing side-channel attacks.
-  if not hmac.compare_digest(expected_sig, actual_sig):
-    return False, "Invalid JWT signature on X-Gateway-Token."
+  signing_input = f"{header_b64}.{payload_b64}"
+  try:
+    pub_key.verify(
+        actual_sig,
+        signing_input.encode("ascii"),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
+  except Exception:
+    return False, "Invalid RS256 signature on X-Gateway-Token."
 
   try:
     claims = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
   except Exception:
     return False, "Invalid JSON payload in X-Gateway-Token."
 
-  # Verify standard JWT claims: issuer (`iss`), subject (`sub`), audience (`aud`), issued-at (`iat`), and expiration (`exp`).
   if claims.get("iss") != "gateway_agent":
     return False, f"Invalid JWT issuer: {claims.get('iss')}"
   if not claims.get("sub"):
@@ -243,7 +286,6 @@ def _init_corporate_sqlite_db() -> sqlite3.Connection:
       "CREATE INDEX idx_corp_first_name ON corp_employees(LOWER(first_name))"
   )
 
-  # Deterministically generate 5,000 employee rows using weighted first-name frequencies.
   rng = random.Random(2026)
   names_pool = [n.capitalize() for n, _ in _WEIGHTED_FIRST_NAMES]
   weights_pool = [w for _, w in _WEIGHTED_FIRST_NAMES]
@@ -316,7 +358,6 @@ def query_corporate_name_analytics(first_name: str = "") -> dict:
       "top_10_corporate_names": top_10_corporate_names,
   }
 
-  # If a specific `first_name` was requested, compute its rank, departments, and office hubs.
   clean_first = (
       first_name.strip().split()[0].capitalize() if first_name.strip() else ""
   )
@@ -399,11 +440,12 @@ a2a_app = to_a2a(
 
 
 async def verify_gateway_jwt_and_rewrite_card(request: Request, call_next):
-  """Enforces Zero-Trust `X-Gateway-Token` JWT verification on all JSON-RPC `POST` requests.
+  """Enforces Zero-Trust `X-Gateway-Token` RS256 JWT verification on all JSON-RPC `POST` requests.
 
   Allows unauthenticated `GET /.well-known/agent-card.json` discovery requests
-  while enforcing strict HMAC-SHA256 `X-Gateway-Token` verification on every
-  JSON-RPC 2.0 `POST` invocation.
+  while enforcing strict RS256 `X-Gateway-Token` verification (against the
+  Gateway's `/.well-known/jwks.json` public key) on every JSON-RPC 2.0 `POST`
+  invocation.
 
   Args:
     request: Incoming Starlette HTTP `Request`.

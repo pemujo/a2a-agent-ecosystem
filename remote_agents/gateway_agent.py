@@ -4,11 +4,12 @@ Serves two side-by-side interfaces so developers can directly compare rigid
 REST APIs with the Agent2Agent (A2A) protocol:
   1. A2A Protocol Interface (`to_a2a(gateway_agent)`):
      - Publishes `/.well-known/agent-card.json` advertising `find_agent_by_service`
-       and `issue_access_token` skills.
+       and `issue_access_token` skills, and `/.well-known/jwks.json` publishing
+       its public RSA verification key (RFC 7517 JWKS).
      - Authenticates the calling agent out-of-band via the HTTP
        `Authorization: Bearer <Google_OIDC_Token>` header attached by the
        caller's transport layer (Application Default Credentials / Cloud IAM).
-     - Mints a short-lived, cryptographically signed HS256 JWT (`X-Gateway-Token`)
+     - Mints a short-lived, asymmetrically signed RS256 JWT (`X-Gateway-Token`)
        scoped to target audience `"corporate_names_analytics_v2"` with a 5-minute TTL.
   2. Rigid REST Interface (`/api/v1/lookup` and `/api/v1/token`):
      - Requires exact internal `service_key` and `target_agent_name` strings
@@ -18,7 +19,6 @@ REST APIs with the Agent2Agent (A2A) protocol:
 import base64
 import contextvars
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -45,6 +45,9 @@ def _load_dotenv_if_present() -> None:
 
 _load_dotenv_if_present()
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import rsa
 from google.adk.a2a.utils.agent_to_a2a import to_a2a
 from google.adk.agents import Agent
 from google.adk.models.google_llm import Gemini
@@ -68,12 +71,20 @@ RETRY_OPTIONS = types.HttpRetryOptions(
 CORPORATE_NAMES_AGENT_URL = os.getenv(
     "CORPORATE_NAMES_AGENT_URL", "http://localhost:8002"
 ).rstrip("/")
-
-# Shared HMAC-SHA256 signing key (use Secret Manager in production deployments)
-GATEWAY_JWT_SECRET = os.getenv(
-    "GATEWAY_JWT_SECRET", "a2a-enterprise-gateway-hs256-signing-secret-2026"
-)
 JWT_TTL_SECONDS = 300
+
+# Ephemeral 2048-bit RSA keypair generated in memory on startup (zero static secrets).
+# The Gateway signs `X-Gateway-Token` JWTs with the private key (`RS256`) and exposes
+# the public key at `GET /.well-known/jwks.json` for downstream agents to verify.
+_GATEWAY_RSA_PRIVATE_KEY = rsa.generate_private_key(
+    public_exponent=65537, key_size=2048
+)
+_GATEWAY_RSA_PUBLIC_NUMBERS = (
+    _GATEWAY_RSA_PRIVATE_KEY.public_key().public_numbers()
+)
+_GATEWAY_KEY_ID = hashlib.sha256(
+    _GATEWAY_RSA_PUBLIC_NUMBERS.n.to_bytes(256, "big")
+).hexdigest()[:16]
 
 # Context variable capturing the incoming HTTP Authorization header out-of-band
 _CALLER_AUTH_HEADER: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -128,18 +139,40 @@ def _b64url_encode(data: bytes) -> str:
   return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
+def get_gateway_jwks() -> dict:
+  """Returns the Gateway's public RSA key in RFC 7517 JSON Web Key Set (JWKS) format."""
+  n_bytes = _GATEWAY_RSA_PUBLIC_NUMBERS.n.to_bytes(
+      (_GATEWAY_RSA_PUBLIC_NUMBERS.n.bit_length() + 7) // 8, "big"
+  )
+  e_bytes = _GATEWAY_RSA_PUBLIC_NUMBERS.e.to_bytes(
+      (_GATEWAY_RSA_PUBLIC_NUMBERS.e.bit_length() + 7) // 8, "big"
+  )
+  return {
+      "keys": [
+          {
+              "kty": "RSA",
+              "alg": "RS256",
+              "use": "sig",
+              "kid": _GATEWAY_KEY_ID,
+              "n": _b64url_encode(n_bytes),
+              "e": _b64url_encode(e_bytes),
+          }
+      ]
+  }
+
+
 def mint_gateway_jwt(subject: str, audience: str) -> str:
-  """Mints a short-lived HS256 JWT scoped to the target A2A agent audience.
+  """Mints a short-lived asymmetric RS256 JWT scoped to the target A2A agent audience.
 
   Args:
     subject: Verified caller principal (e.g., Google Cloud OIDC email or subject).
     audience: Target A2A agent identifier (e.g., `'corporate_names_analytics_v2'`).
 
   Returns:
-    A 3-segment signed HS256 JWT string (`<header>.<payload>.<signature>`).
+    A 3-segment signed RS256 JWT string (`<header>.<payload>.<signature>`).
   """
   now = int(time.time())
-  header = {"alg": "HS256", "typ": "JWT"}
+  header = {"alg": "RS256", "typ": "JWT", "kid": _GATEWAY_KEY_ID}
   payload = {
       "iss": "gateway_agent",
       "sub": subject,
@@ -147,16 +180,15 @@ def mint_gateway_jwt(subject: str, audience: str) -> str:
       "iat": now,
       "exp": now + JWT_TTL_SECONDS,
   }
-  # Encode the JWT header and payload as URL-safe Base64 segments and sign with HMAC-SHA256.
   signing_input = (
       f"{_b64url_encode(json.dumps(header, separators=(',', ':')).encode())}."
       f"{_b64url_encode(json.dumps(payload, separators=(',', ':')).encode())}"
   )
-  signature = hmac.new(
-      GATEWAY_JWT_SECRET.encode("utf-8"),
+  signature = _GATEWAY_RSA_PRIVATE_KEY.sign(
       signing_input.encode("ascii"),
-      hashlib.sha256,
-  ).digest()
+      padding.PKCS1v15(),
+      hashes.SHA256(),
+  )
   return f"{signing_input}.{_b64url_encode(signature)}"
 
 
@@ -190,7 +222,6 @@ def verify_caller_google_identity(auth_header: str) -> tuple[bool, str]:
   if not raw_token:
     return False, "Empty Bearer token in HTTP Authorization header."
 
-  # Check the short-lived SHA-256-keyed verification cache first.
   token_digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
   now = time.time()
   cached = _VERIFIED_TOKEN_CACHE.get(token_digest)
@@ -269,7 +300,6 @@ def find_agent_by_service(service_name: str) -> dict:
     flag, `auth_instructions`, and `capabilities`, or an error dictionary
     listing `available_services`.
   """
-  # Normalize the service name and map friendly aliases to `'corp_analytics_registry'`.
   key = service_name.lower().strip().replace(" ", "_")
   if key in _CORPORATE_AGENT_ALIASES:
     key = "corp_analytics_registry"
@@ -290,10 +320,9 @@ def issue_access_token(target_agent_name: str) -> dict:
 
   Returns:
     A dictionary containing `status='granted'`, `caller_principal`,
-    `target_agent`, `header_name='X-Gateway-Token'`, `token_type='JWT (HS256)'`,
+    `target_agent`, `header_name='X-Gateway-Token'`, `token_type='JWT (RS256)'`,
     `expires_in_seconds`, and `access_token`, or an error/denial dictionary.
   """
-  # Resolve target agent aliases to the canonical internal ID (`corporate_names_analytics_v2`).
   raw_target = target_agent_name.lower().strip().replace(" ", "_")
   target = (
       "corporate_names_analytics_v2"
@@ -308,7 +337,6 @@ def issue_access_token(target_agent_name: str) -> dict:
         ),
     }
 
-  # Read the caller's HTTP `Authorization: Bearer` header captured out-of-band by middleware.
   auth_header = _CALLER_AUTH_HEADER.get()
   verified, principal_or_err = verify_caller_google_identity(auth_header)
   if not verified:
@@ -320,14 +348,13 @@ def issue_access_token(target_agent_name: str) -> dict:
         ),
     }
 
-  # Mint a short-lived HS256 JWT scoped specifically to `aud=target`.
   signed_jwt = mint_gateway_jwt(subject=principal_or_err, audience=target)
   return {
       "status": "granted",
       "caller_principal": principal_or_err,
       "target_agent": target,
       "header_name": "X-Gateway-Token",
-      "token_type": "JWT (HS256)",
+      "token_type": "JWT (RS256)",
       "expires_in_seconds": JWT_TTL_SECONDS,
       "access_token": signed_jwt,
   }
@@ -346,7 +373,7 @@ gateway_agent = Agent(
         "Gateway Agent (Central Service Registry and OIDC-to-JWT Token Broker)."
         " Maps service categories ('corp_analytics_registry') to remote A2A"
         " agent URLs and exchanges the caller's Google Cloud OIDC/ADC identity"
-        " for a short-lived, signed 'X-Gateway-Token' JWT."
+        " for a short-lived, asymmetrically signed 'X-Gateway-Token' RS256 JWT."
     ),
     instruction="""
     You are the Gateway Agent (Central Service Registry and OIDC-to-JWT Token Broker).
@@ -357,7 +384,7 @@ gateway_agent = Agent(
        - When returning a protected agent's URL, inform the caller that it requires a signed 'X-Gateway-Token' JWT, which they can request from you via 'issue_access_token'.
 
     2. OIDC-TO-JWT TOKEN BROKER ('issue_access_token'):
-       - Exchanges the caller's out-of-band Google Cloud OIDC/ADC Bearer token (attached automatically in the HTTP Authorization header) for a short-lived, signed 'X-Gateway-Token' JWT scoped to 'corporate_names_analytics_v2'.
+       - Exchanges the caller's out-of-band Google Cloud OIDC/ADC Bearer token (attached automatically in the HTTP Authorization header) for a short-lived, asymmetrically signed RS256 'X-Gateway-Token' JWT scoped to 'corporate_names_analytics_v2'.
        - If the caller refers to the corporate names agent in natural language (e.g. 'corporate_names_analytics_agent', 'corporate names agent', 'corp_analytics_registry'), map it to target_agent_name='corporate_names_analytics_v2'.
        - When 'issue_access_token' grants a JWT, ALWAYS include the exact, unmodified 'access_token' JWT string in your response so the calling agent can attach it in 'X-Gateway-Token'.
     """,
@@ -368,15 +395,7 @@ a2a_app = to_a2a(gateway_agent, port=int(os.getenv("PORT", "8001")))
 
 
 async def capture_auth_and_rewrite_card(request: Request, call_next):
-  """Captures the incoming HTTP `Authorization` header out-of-band for OIDC token verification.
-
-  Args:
-    request: Incoming Starlette HTTP `Request`.
-    call_next: Next ASGI middleware or route handler in the Starlette pipeline.
-
-  Returns:
-    The downstream HTTP `Response`.
-  """
+  """Captures the incoming HTTP `Authorization` header out-of-band for OIDC token verification."""
   token_reset = _CALLER_AUTH_HEADER.set(
       request.headers.get("authorization", "")
   )
@@ -391,20 +410,15 @@ a2a_app.add_middleware(
 )
 
 
+async def jwks_endpoint(request: Request) -> JSONResponse:
+  """Publishes the Gateway's public RSA key at `GET /.well-known/jwks.json` (RFC 7517)."""
+  del request
+  return JSONResponse(get_gateway_jwks())
+
+
 # --- Legacy Rigid REST Endpoints (to contrast with A2A) ---
 async def rest_lookup_endpoint(request: Request) -> JSONResponse:
-  """REST endpoint (`GET /api/v1/lookup`): requires exact query param `?service_key=<key>`.
-
-  Unlike `find_agent_by_service` in the A2A interface, this rigid REST endpoint
-  does not resolve semantic aliases and returns `400 Bad Request` whenever the
-  caller passes a legacy or friendly service name.
-
-  Args:
-    request: Incoming Starlette HTTP `Request`.
-
-  Returns:
-    A `JSONResponse` with the registry entry (`200 OK`) or `400 Bad Request`.
-  """
+  """REST endpoint (`GET /api/v1/lookup`): requires exact query param `?service_key=<key>`."""
   raw_key = request.query_params.get("service_key", "")
   service_key = raw_key.lower().strip().replace(" ", "_")
   if service_key not in SERVICE_REGISTRY:
@@ -416,15 +430,7 @@ async def rest_lookup_endpoint(request: Request) -> JSONResponse:
 
 
 async def rest_token_endpoint(request: Request) -> JSONResponse:
-  """REST endpoint (`POST /api/v1/token`): requires exact JSON body field `target_agent_name` and HTTP Bearer header.
-
-  Args:
-    request: Incoming Starlette HTTP `Request`.
-
-  Returns:
-    A `JSONResponse` containing the minted `X-Gateway-Token` JWT (`200 OK`), or
-    `400`/`401`/`422` on schema or authentication errors.
-  """
+  """REST endpoint (`POST /api/v1/token`): requires exact JSON body field `target_agent_name` and HTTP Bearer header."""
   try:
     body = await request.json()
   except Exception:
@@ -452,6 +458,7 @@ async def rest_token_endpoint(request: Request) -> JSONResponse:
 
 
 a2a_app.routes.extend([
+    Route("/.well-known/jwks.json", jwks_endpoint, methods=["GET"]),
     Route("/api/v1/lookup", rest_lookup_endpoint, methods=["GET"]),
     Route("/api/v1/token", rest_token_endpoint, methods=["POST"]),
 ])

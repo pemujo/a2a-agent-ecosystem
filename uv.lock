@@ -11,6 +11,7 @@ name = "a2a-agent-ecosystem"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "google-adk", extra = ["a2a"] },
     { name = "google-auth" },
     { name = "google-genai" },
@@ -23,6 +24,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=43.0.0" },
     { name = "google-adk", extras = ["a2a"], specifier = ">=1.0.0" },
     { name = "google-auth", specifier = ">=2.35.0" },
     { name = "google-genai", specifier = ">=1.0.0" },
